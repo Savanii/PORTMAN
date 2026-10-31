@@ -1,3 +1,5 @@
+import openpyxl
+from openpyxl.utils import column_index_from_string
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -15,7 +17,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 import io
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
 from decimal import Decimal
 from flask import (
     render_template,
@@ -2172,7 +2174,7 @@ def barge_discharge_report():
         conn.close()
 
 # from flask import request, jsonify
-# from datetime import datetime, timedelta
+# from datetime import datetime, date, timedelta
 # # from your_app import bp, login_required, get_db, get_cursor  # keep your existing imports
 
 
@@ -5321,6 +5323,1116 @@ def _build_vessel_discharge_progress_sheet(wb, cur, report_date):
     ws2.column_dimensions[act_col_letter].width = 16
 
 
+# ============================================================================
+# 3RD SHEET: JETTY DISCHARGE REPORT (DAILY PROGRESS REPORT)
+# ============================================================================
+
+import calendar
+
+def _load_dynamic_cargo_columns(cur):
+    """
+    Dynamically loads all cargo records from vessel_cargo and any unmapped active cargos
+    from lueu_lines, without hardcoding cargo names or cargo types.
+    """
+    cur.execute("""
+        SELECT 
+            id, 
+            COALESCE(TRIM(cargo_type), 'Other') as cargo_type, 
+            COALESCE(TRIM(cargo_category), 'Other') as cargo_category, 
+            TRIM(cargo_name) as cargo_name
+        FROM vessel_cargo
+        ORDER BY id ASC
+    """)
+    db_rows = cur.fetchall()
+
+    # Also check if lueu_lines has any active cargo not in vessel_cargo
+    cur.execute("""
+        SELECT DISTINCT TRIM(cargo_name) AS cargo_name
+        FROM lueu_lines
+        WHERE cargo_name IS NOT NULL AND TRIM(cargo_name) != ''
+          AND (is_deleted IS FALSE OR is_deleted IS NULL)
+    """)
+    raw_lines = cur.fetchall()
+    line_cargos = []
+    for r in raw_lines:
+        cval = (r.get('cargo_name') or r.get('btrim')) if isinstance(r, dict) else r[0]
+        if cval:
+            line_cargos.append(str(cval).strip())
+
+    existing_names = {r['cargo_name'].upper() for r in db_rows if r['cargo_name']}
+    extra_rows = []
+    next_id = 9000
+    for lc in line_cargos:
+        if lc.upper() not in existing_names:
+            extra_rows.append({
+                'id': next_id,
+                'cargo_type': 'Other',
+                'cargo_category': 'Other',
+                'cargo_name': lc
+            })
+            existing_names.add(lc.upper())
+            next_id += 1
+
+    all_cargos = list(db_rows) + extra_rows
+
+    cargo_columns = []
+    alias_map = {}
+    for i, c in enumerate(all_cargos):
+        col_letter = openpyxl.utils.get_column_letter(2 + i)
+        c_name = c['cargo_name']
+        c_type = c['cargo_type']
+        c_cat = c['cargo_category']
+        col_info = {
+            'col_index': 2 + i,
+            'col_letter': col_letter,
+            'id': c['id'],
+            'cargo_type': c_type,
+            'cargo_category': c_cat,
+            'cargo_name': c_name,
+            'tuple': (col_letter, c_cat, c_name, c_type)
+        }
+        cargo_columns.append(col_info)
+        alias_map[c_name.upper()] = col_letter
+
+    cargo_groups = []
+    current_grp = None
+    for col in cargo_columns:
+        grp_name = col['cargo_category'] or col['cargo_type'] or 'Other'
+        if current_grp and current_grp['name'] == grp_name:
+            current_grp['colspan'] += 1
+            current_grp['end_col'] = col['col_letter']
+            current_grp['end_idx'] = col['col_index']
+        else:
+            current_grp = {
+                'name': grp_name,
+                'cargo_type': col['cargo_type'],
+                'colspan': 1,
+                'start_col': col['col_letter'],
+                'end_col': col['col_letter'],
+                'start_idx': col['col_index'],
+                'end_idx': col['col_index']
+            }
+            cargo_groups.append(current_grp)
+
+    return cargo_columns, cargo_groups, alias_map
+
+
+def _get_equipment_short_name(name):
+    """Normalize equipment name into clean report short name."""
+    import re
+    n = str(name or '').strip()
+    upper_n = n.upper()
+    if 'BARGE UNLOADER 1' in upper_n: return 'BU 1'
+    if 'BARGE UNLOADER 2' in upper_n: return 'BU 2'
+    if 'BARGE UNLOADER' in upper_n: return upper_n.replace('BARGE UNLOADER', 'BU').strip()
+    if 'SENNEBOGEN J1' in upper_n or 'SENNEBOGEN 01' in upper_n or 'SEN @ J-1' in upper_n: return 'Sen @ J-1'
+    if 'SENNEBOGEN J5' in upper_n or 'SENNEBOGEN 05' in upper_n or 'SEN @ J-5' in upper_n: return 'Sen @ J-5'
+    if '285' in upper_n: return 'Excavator 285'
+    m = re.match(r'BUL[-_\s]*0*(\d+)', upper_n)
+    if m:
+        return f"BUL-{m.group(1)}"
+    return n
+
+
+def _load_dynamic_equipment_list(cur):
+    """
+    Dynamically loads all active equipment from table equipment (VEM01)
+    and lueu_lines.
+    """
+    cur.execute("SELECT id, TRIM(name) as name FROM equipment WHERE name IS NOT NULL AND TRIM(name) != '' ORDER BY id, name")
+    db_rows = cur.fetchall()
+
+    cur.execute("""
+        SELECT DISTINCT TRIM(equipment_name) as name
+        FROM lueu_lines
+        WHERE equipment_name IS NOT NULL AND TRIM(equipment_name) != ''
+          AND (is_deleted IS FALSE OR is_deleted IS NULL)
+    """)
+    line_rows = cur.fetchall()
+
+    existing = set()
+    equipments = []
+    for r in db_rows:
+        raw_name = r['name']
+        short_name = _get_equipment_short_name(raw_name)
+        if short_name.upper() not in existing:
+            existing.add(short_name.upper())
+            equipments.append({'raw_name': raw_name, 'short_name': short_name})
+
+    for r in line_rows:
+        raw_name = r['name']
+        short_name = _get_equipment_short_name(raw_name)
+        if short_name.upper() not in existing:
+            existing.add(short_name.upper())
+            equipments.append({'raw_name': raw_name, 'short_name': short_name})
+
+    return equipments
+
+
+def _load_dynamic_delay_columns(cur):
+    """
+    Dynamically builds delay groups and equipment columns from the database.
+    """
+    equipments = _load_dynamic_equipment_list(cur)
+
+    # 1. RMHS System (from conveyor_routes / port systems)
+    rmhs_defs = [
+        ('BX', 'C-131'),
+        ('BY', 'C-131 A'),
+        ('BZ', 'C-131 D / C 131 C'),
+        ('CA', 'C 131 E'),
+        ('CB', 'C 131 F'),
+        ('CC', 'Stacker Route'),
+        ('CD', 'Jetty Yard Sracker (LS1,LS2,LS3)'),
+        ('CE', 'LS 5 /Cement- Plant')
+    ]
+    rmhs_cols = []
+    delay_columns = []
+    for k, name in rmhs_defs:
+        col_item = (k, 'RMHS System', name)
+        rmhs_cols.append(col_item)
+        delay_columns.append(col_item)
+
+    # 2. Equipments idle for DTC (starts with BUs, then dynamic unloader/cranes)
+    dtc_cols = [('CF', 'Equipments idle for DTC', 'BUs')]
+    delay_columns.append(dtc_cols[0])
+    dtc_map = {}
+    dtc_std = {'BU 1': 'CG', 'BU 2': 'CH', 'Sen @ J-1': 'CI', 'Sen @ J-5': 'CJ',
+               'BUL-1': 'CK', 'BUL-2': 'CL', 'BUL-3': 'CM', 'BUL-4': 'CN', 'BUL-5': 'CO'}
+    idx_extra = 1
+    for eq in equipments:
+        s_name = eq['short_name']
+        if s_name == 'Excavator 285':
+            continue
+        k = dtc_std.get(s_name) or f"DTC_X_{idx_extra}"
+        if not dtc_std.get(s_name):
+            idx_extra += 1
+        dtc_map[s_name] = k
+        col_item = (k, 'Equipments idle for DTC', s_name)
+        dtc_cols.append(col_item)
+        delay_columns.append(col_item)
+
+    # 3. No Cargo (starts with BUs, BU 1, BU 2, Sen @ J-1, combos, then dynamic BULs)
+    no_cargo_cols = [('CP', 'No Cargo', 'BUs')]
+    delay_columns.append(no_cargo_cols[0])
+    no_cargo_std = {'BU 1': 'CQ', 'BU 2': 'CR', 'Sen @ J-1': 'CS',
+                    'BUL-1': 'CV', 'BUL-2': 'CW', 'BUL-3': 'CX', 'BUL-4': 'CY', 'BUL-5': 'CZ'}
+    no_cargo_map = {}
+
+    for s_name in ['BU 1', 'BU 2', 'Sen @ J-1']:
+        k = no_cargo_std.get(s_name)
+        if k:
+            no_cargo_map[s_name] = k
+            col_item = (k, 'No Cargo', s_name)
+            no_cargo_cols.append(col_item)
+            delay_columns.append(col_item)
+
+    col_ct = ('CT', 'No Cargo', 'BU-1 + Sen J1')
+    col_cu = ('CU', 'No Cargo', 'Sen @ J-5 / EX 650')
+    no_cargo_cols.extend([col_ct, col_cu])
+    delay_columns.extend([col_ct, col_cu])
+    no_cargo_map['Sen @ J-5'] = 'CU'
+
+    idx_nc_extra = 1
+    for eq in equipments:
+        s_name = eq['short_name']
+        if s_name in ['BU 1', 'BU 2', 'Sen @ J-1', 'Sen @ J-5', 'Excavator 285']:
+            continue
+        k = no_cargo_std.get(s_name) or f"NC_X_{idx_nc_extra}"
+        if not no_cargo_std.get(s_name):
+            idx_nc_extra += 1
+        no_cargo_map[s_name] = k
+        col_item = (k, 'No Cargo', s_name)
+        no_cargo_cols.append(col_item)
+        delay_columns.append(col_item)
+
+    # 4. Non Availability of Equipments
+    non_avail_cols = [('DA', 'Non Availability of Equipments', 'BUs')]
+    delay_columns.append(non_avail_cols[0])
+    non_avail_std = {'BU 1': 'DB', 'BU 2': 'DC', 'Sen @ J-1': 'DD', 'Sen @ J-5': 'DE',
+                     'BUL-1': 'DF', 'BUL-2': 'DG', 'BUL-3': 'DH', 'BUL-4': 'DI', 'BUL-5': 'DJ',
+                     'Excavator 285': 'DK'}
+    non_avail_map = {}
+    idx_na_extra = 1
+    for eq in equipments:
+        s_name = eq['short_name']
+        k = non_avail_std.get(s_name) or f"NA_X_{idx_na_extra}"
+        if not non_avail_std.get(s_name):
+            idx_na_extra += 1
+        non_avail_map[s_name] = k
+        col_item = (k, 'Non Availability of Equipments', s_name)
+        non_avail_cols.append(col_item)
+        delay_columns.append(col_item)
+
+    col_dl = ('DL', 'Non Availability of Equipments', 'Jetty Conveyors')
+    non_avail_cols.append(col_dl)
+    delay_columns.append(col_dl)
+
+    # 5. Idle Equipments
+    idle_cols = []
+    idle_map = {}
+    for s_name, k in [('Sen @ J-1', 'DM'), ('Sen @ J-5', 'DN')]:
+        col_item = (k, 'Idle Equipments', s_name)
+        idle_cols.append(col_item)
+        delay_columns.append(col_item)
+        idle_map[s_name] = k
+
+    delay_groups = [
+        {'name': 'RMHS System', 'colspan': len(rmhs_cols), 'columns': rmhs_cols},
+        {'name': 'Equipments idle for DTC', 'colspan': len(dtc_cols), 'columns': dtc_cols},
+        {'name': 'No Cargo', 'colspan': len(no_cargo_cols), 'columns': no_cargo_cols},
+        {'name': 'Non Availability of Equipments', 'colspan': len(non_avail_cols), 'columns': non_avail_cols},
+        {'name': 'Idle Equipments', 'colspan': len(idle_cols), 'columns': idle_cols},
+    ]
+
+    dispatch_maps = {
+        'rmhs_cols': rmhs_cols,
+        'dtc_cols': dtc_cols,
+        'no_cargo_cols': no_cargo_cols,
+        'non_avail_cols': non_avail_cols,
+        'idle_cols': idle_cols,
+        'dtc_map': dtc_map,
+        'no_cargo_map': no_cargo_map,
+        'non_avail_map': non_avail_map,
+        'idle_map': idle_map
+    }
+
+    return delay_columns, delay_groups, dispatch_maps
+
+
+JETTY_YELLOW_COLUMNS = [
+    ('DQ', 'Route Hrs'),
+    ('DR', 'NO CARGO (Hrs)'),
+    ('DS', 'RMHS (Hrs)'),
+    ('DT', 'Cement_Plant (Hrs)'),
+    ('DU', 'Bad Wx (Hrs)'),
+    ('DV', 'Idle Eq of Sen J5 & J1 (Hrs)'),
+    ('DW', 'Available Hours'),
+    ('DX', 'Cargo Handled by Sen J5,J 1 & Excavator 650 (MT)'),
+    ('DY', 'Cargo Handled Excluding J5 & J1 (MT)'),
+    ('DZ', 'Total Cargo Handled'),
+    ('EA', 'Net Discharge Rate / Day (MT)'),
+    ('EB', 'Remarks'),
+]
+
+def _norm_equipment_name(eq_name):
+    e = str(eq_name or '').strip().upper()
+    if 'BARGE UNLOADER 1' in e or e == 'BU 1': return 'BU 1'
+    if 'BARGE UNLOADER 2' in e or e == 'BU 2': return 'BU 2'
+    if 'BUL-01' in e or 'BUL 01' in e or e == 'BUL-1': return 'BUL-1'
+    if 'BUL-02' in e or 'BUL 02' in e or e == 'BUL-2': return 'BUL-2'
+    if 'BUL-03' in e or 'BUL 03' in e or e == 'BUL-3': return 'BUL-3'
+    if 'BUL-04' in e or 'BUL 04' in e or e == 'BUL-4': return 'BUL-4'
+    if 'BUL-05' in e or 'BUL 05' in e or e == 'BUL-5': return 'BUL-5'
+    if 'SENNEBOGEN 01' in e or 'SENNEBOGEN J1' in e or 'SEN @ J-1' in e: return 'Sen @ J-1'
+    if 'SENNEBOGEN 05' in e or 'SENNEBOGEN J5' in e or 'SEN @ J-5' in e: return 'Sen @ J-5'
+    if '285' in e or 'EXAVATOR' in e or 'EXCAVATOR' in e: return 'Excavator 285'
+    return e
+
+def _parse_time_diff_minutes(from_t, to_t):
+    if not from_t or not to_t:
+        return None
+    try:
+        f_str = str(from_t).strip()
+        t_str = str(to_t).strip()
+        if ' ' in f_str: f_str = f_str.split(' ')[1]
+        if ' ' in t_str: t_str = t_str.split(' ')[1]
+        fp = f_str.split(':')
+        tp = t_str.split(':')
+        f_min = int(fp[0]) * 60 + int(fp[1])
+        t_min = int(tp[0]) * 60 + int(tp[1])
+        if t_min <= f_min:
+            t_min += 1440
+        return t_min - f_min
+    except Exception:
+        return None
+
+def _format_minutes_to_hms(mins):
+    if mins is None or mins == 0:
+        return '0:00:00'
+    total_sec = int(round(mins * 60))
+    h = total_sec // 3600
+    m = (total_sec % 3600) // 60
+    s = total_sec % 60
+    return f"{h}:{m:02d}:{s:02d}"
+
+def _classify_delay(delay_name, eq_norm, system_name, dispatch_maps=None):
+    dn = str(delay_name or '').strip().upper()
+    sn = str(system_name or '').strip().upper()
+    if dispatch_maps is None:
+        dispatch_maps = {}
+    dtc_map = dispatch_maps.get('dtc_map', {})
+    no_cargo_map = dispatch_maps.get('no_cargo_map', {})
+    non_avail_map = dispatch_maps.get('non_avail_map', {})
+    idle_map = dispatch_maps.get('idle_map', {})
+
+    if 'BAD WEATHER' in dn:
+        return ('BAD_WX', None)
+
+    # RMHS System
+    if 'C-131 A' in dn or 'C 131 A' in dn or 'C-131 A' in sn:
+        return ('RMHS', 'BY')
+    elif 'C-131 C' in dn or 'C-131 D' in dn or 'C 131 C' in dn or 'C 131 D' in dn or 'C-131 C' in sn or 'C-131 D' in sn:
+        return ('RMHS', 'BZ')
+    elif 'C-131 E' in dn or 'C 131 E' in dn or 'C-131 E' in sn:
+        return ('RMHS', 'CA')
+    elif 'C-131 F' in dn or 'C 131 F' in dn or 'C-131 F' in sn:
+        return ('RMHS', 'CB')
+    elif 'C-131' in dn or 'C 131' in dn or 'C-131' in sn:
+        return ('RMHS', 'BX')
+    elif 'STACKER ROUTE' in dn or 'COAL STACKER' in dn:
+        return ('RMHS', 'CC')
+    elif any(x in dn for x in ['LS-1', 'LS-2', 'LS-3', 'LS 1', 'LS 2', 'LS 3']):
+        return ('RMHS', 'CD')
+    elif 'LS-5' in dn or 'LS 5' in dn or 'CEMENT' in dn:
+        return ('RMHS', 'CE')
+
+    # Equipments idle for DTC
+    if 'DTC' in dn or 'IDLE DUE TO' in dn:
+        col_key = dtc_map.get(eq_norm, 'CF')
+        return ('IDLE_DTC', col_key)
+
+    # No Cargo
+    if 'NO CARGO' in dn or 'NO DUMPER' in dn or 'HOPPER EMPTY' in dn:
+        col_key = no_cargo_map.get(eq_norm, 'CP')
+        return ('NO_CARGO', col_key)
+
+    # Non Availability of Equipments
+    if any(x in dn for x in ['BREAKDOWN', 'SHUTDOWN', 'MAINTENANCE', 'POWER FAILURE', 'JAMMING', 'CLEANING']):
+        if 'CONVEYOR' in dn or 'BELT' in dn or 'CHUTE' in dn:
+            return ('NON_AVAIL', 'DL')
+        col_key = non_avail_map.get(eq_norm, 'DA')
+        return ('NON_AVAIL', col_key)
+
+    # Idle Equipments
+    if 'IDLE' in dn:
+        if eq_norm in idle_map:
+            return ('IDLE_EQ', idle_map[eq_norm])
+        else:
+            col_key = dtc_map.get(eq_norm, 'CF')
+            return ('IDLE_DTC', col_key)
+
+    return ('OTHER', None)
+
+
+def _get_jetty_discharge_data(cur, report_date):
+    """Fetch day-wise discharge, grades, delays, and yellow table calculations
+    for the reporting month, dynamically deriving cargo and equipment/delay columns.
+    """
+    report_dt = datetime.strptime(report_date, "%Y-%m-%d")
+
+    if report_dt.day == 1:
+        prev_month_last_day = report_dt.replace(day=1) - timedelta(days=1)
+        target_year = prev_month_last_day.year
+        target_month = prev_month_last_day.month
+        month_start_date = date(target_year, target_month, 1)
+        _, last_day_num = calendar.monthrange(target_year, target_month)
+        month_end_date = date(target_year, target_month, last_day_num)
+        data_cutoff_date = month_end_date
+    else:
+        target_year = report_dt.year
+        target_month = report_dt.month
+        month_start_date = date(target_year, target_month, 1)
+        _, last_day_num = calendar.monthrange(target_year, target_month)
+        month_end_date = date(target_year, target_month, last_day_num)
+        data_cutoff_date = report_dt.date()
+
+    month_name = calendar.month_name[target_month]
+    month_label = f"{month_name} :-{target_year}"
+
+    # Load cargo columns dynamically from vessel_cargo
+    cargo_columns, cargo_groups, cargo_alias_map = _load_dynamic_cargo_columns(cur)
+
+    # Load equipment and delay columns dynamically from equipment & lueu_lines
+    delay_columns, delay_groups, dispatch_maps = _load_dynamic_delay_columns(cur)
+    no_cargo_cols = dispatch_maps.get('no_cargo_cols', [])
+    idle_cols = dispatch_maps.get('idle_cols', [])
+
+    # Fetch day-wise cargo quantities
+    cur.execute("""
+        SELECT 
+            entry_date,
+            TRIM(cargo_name) AS cargo_name,
+            SUM(COALESCE(quantity, 0)) AS total_qty
+        FROM lueu_lines
+        WHERE entry_date >= %s AND entry_date <= %s
+          AND is_deleted IS NOT TRUE
+          AND cargo_name IS NOT NULL AND TRIM(cargo_name) != ''
+        GROUP BY entry_date, TRIM(cargo_name)
+    """, [month_start_date.strftime('%Y-%m-%d'), month_end_date.strftime('%Y-%m-%d')])
+    cargo_rows = cur.fetchall()
+
+    # Fetch Sennebogen & Excavator quantities (for DX)
+    cur.execute("""
+        SELECT 
+            entry_date,
+            SUM(COALESCE(quantity, 0)) AS sen_qty
+        FROM lueu_lines
+        WHERE entry_date >= %s AND entry_date <= %s
+          AND is_deleted IS NOT TRUE
+          AND (
+              UPPER(equipment_name) LIKE '%%SENNEBOGEN%%'
+              OR UPPER(equipment_name) LIKE '%%SEN @ J%%'
+              OR UPPER(equipment_name) LIKE '%%EXAVATOR%%'
+              OR UPPER(equipment_name) LIKE '%%EXCAVATOR%%'
+              OR UPPER(equipment_name) LIKE '%%285%%'
+          )
+        GROUP BY entry_date
+    """, [month_start_date.strftime('%Y-%m-%d'), month_end_date.strftime('%Y-%m-%d')])
+    sen_rows = {str(r['entry_date'])[:10]: float(r.get('sen_qty') or 0) for r in cur.fetchall()}
+
+    # Fetch delay rows
+    cur.execute("""
+        SELECT 
+            entry_date,
+            equipment_name,
+            system_name,
+            delay_name,
+            from_time,
+            to_time
+        FROM lueu_lines
+        WHERE entry_date >= %s AND entry_date <= %s
+          AND is_deleted IS NOT TRUE
+          AND delay_name IS NOT NULL AND TRIM(delay_name) != ''
+          AND delay_name NOT IN ('Unloading', 'Dumper Loading')
+    """, [month_start_date.strftime('%Y-%m-%d'), month_end_date.strftime('%Y-%m-%d')])
+    delay_rows = cur.fetchall()
+
+    daily_cargos = {}
+    daily_distinct_grades = {}
+    for r in cargo_rows:
+        entry_d = r['entry_date']
+        cname = r['cargo_name']
+        qty = r['total_qty']
+        d_str = str(entry_d)[:10]
+        q = float(qty or 0)
+        cname_clean = str(cname).strip().upper()
+        col_let = cargo_alias_map.get(cname_clean)
+        if not col_let:
+            for a_name, l_code in cargo_alias_map.items():
+                if a_name in cname_clean or cname_clean in a_name:
+                    col_let = l_code
+                    break
+        if not col_let and cargo_columns:
+            col_let = cargo_columns[0]['col_letter']
+        if col_let:
+            daily_cargos.setdefault(d_str, {})
+            daily_cargos[d_str][col_let] = daily_cargos[d_str].get(col_let, 0.0) + q
+            if q > 0:
+                daily_distinct_grades.setdefault(d_str, set()).add(cname_clean)
+
+    daily_delays = {}
+    daily_bad_wx = {}
+    for r in delay_rows:
+        entry_d = r['entry_date']
+        eq = r['equipment_name']
+        sn = r['system_name']
+        dn = r['delay_name']
+        ft = r['from_time']
+        tt = r['to_time']
+        d_str = str(entry_d)[:10]
+        mins = _parse_time_diff_minutes(ft, tt)
+        if mins is None:
+            continue
+        eq_n = _get_equipment_short_name(eq)
+        cat, col_let = _classify_delay(dn, eq_n, sn, dispatch_maps)
+        if cat == 'BAD_WX':
+            daily_bad_wx[d_str] = daily_bad_wx.get(d_str, 0.0) + mins
+        elif col_let:
+            daily_delays.setdefault(d_str, {})
+            daily_delays[d_str][col_let] = daily_delays[d_str].get(col_let, 0.0) + mins
+
+    days_data = []
+    active_days_count = 0
+    total_cargo_sum = 0.0
+
+    nc_keys = [c[0] for c in no_cargo_cols]
+    idle_keys = [c[0] for c in idle_cols]
+
+    for day_num in range(1, last_day_num + 1):
+        cur_d = date(target_year, target_month, day_num)
+        d_str = cur_d.strftime('%Y-%m-%d')
+        d_label = cur_d.strftime('%d-%b-%y')
+        is_active = (cur_d <= data_cutoff_date)
+
+        day_obj = {
+            'day': day_num,
+            'date': d_str,
+            'date_label': d_label,
+            'is_active': is_active,
+            'cargos': {},
+            'delays': {},
+            'delays_hms': {},
+            'grade_count': 0,
+            'grand_total': 0.0,
+            'yellow': {}
+        }
+
+        if is_active:
+            active_days_count += 1
+            c_dict = daily_cargos.get(d_str, {})
+            day_total = sum(c_dict.values())
+            day_obj['cargos'] = c_dict
+            day_obj['grade_count'] = len([col_k for col_k, col_v in c_dict.items() if col_v > 0])
+            day_obj['grand_total'] = round(day_total, 2)
+            total_cargo_sum += day_total
+
+            d_dict = daily_delays.get(d_str, {})
+            d_hms = {k: _format_minutes_to_hms(v) for k, v in d_dict.items()}
+            day_obj['delays'] = d_dict
+            day_obj['delays_hms'] = d_hms
+
+            dq = 168.0
+
+            # DR: NO CARGO (Hrs)
+            cq_m = d_dict.get('CQ', 0.0)
+            cr_m = d_dict.get('CR', 0.0)
+            dr_other = sum(d_dict.get(k, 0.0) for k in nc_keys if k not in ('CQ', 'CR'))
+            dr_mins = dr_other + (cq_m + cr_m) / 2.0
+            dr = dr_mins / 60.0
+
+            # DS: RMHS (Hrs)
+            bx_m = d_dict.get('BX', 0.0)
+            by_m = d_dict.get('BY', 0.0)
+            bz_m = d_dict.get('BZ', 0.0)
+            ca_m = d_dict.get('CA', 0.0)
+            cb_m = d_dict.get('CB', 0.0)
+            cc_m = d_dict.get('CC', 0.0)
+            ds_mins = bx_m + by_m + bz_m + ca_m + cb_m + cc_m
+            ds = ds_mins / 60.0
+
+            # DT: Cement_Plant (Hrs)
+            ce_m = d_dict.get('CE', 0.0)
+            dt = ce_m / 60.0
+
+            # DU: Bad Wx (Hrs)
+            du = daily_bad_wx.get(d_str, 0.0) / 60.0
+
+            # DV: Idle Eq of Sen J5 & J1
+            dv_mins = sum(d_dict.get(k, 0.0) for k in idle_keys)
+            dv = dv_mins / 60.0
+
+            # DW: Available Hours = DQ - DR - DS - DU - DT
+            dw = round(max(0.0, dq - dr - ds - du - dt), 2)
+
+            # DX: Cargo Handled by Sen J5, J1 & Excavator 650
+            dx = sen_rows.get(d_str, 0.0)
+
+            # DY: Cargo Handled Excluding J5 & J1 = BW - DX
+            dy = day_total - dx
+
+            # DZ: Total Cargo Handled = BW
+            dz = day_total
+
+            # EA: Net Discharge Rate / Day = (DZ / DW) * DQ
+            ea = ((dz / dw) * dq) if dw > 0 else 0.0
+
+            day_obj['yellow'] = {
+                'DQ': dq,
+                'DR': round(dr, 2),
+                'DS': round(ds, 2),
+                'DT': round(dt, 2),
+                'DU': round(du, 2),
+                'DV': round(dv, 2),
+                'DW': round(dw, 2),
+                'DX': round(dx, 2),
+                'DY': round(dy, 2),
+                'DZ': round(dz, 2),
+                'EA': round(ea, 2),
+                'EB': '',
+                'route_hrs': dq,
+                'no_cargo_hrs': round(dr, 2),
+                'rmhs_hrs': round(ds, 2),
+                'cement_plant_hrs': round(dt, 2),
+                'bad_wx_hrs': round(du, 2),
+                'idle_sen_hrs': round(dv, 2),
+                'avail_hrs': round(dw, 2),
+                'sen_qty': round(dx, 2),
+                'excl_sen_qty': round(dy, 2),
+                'total_handled': round(dz, 2),
+                'net_rate': round(ea, 2),
+                'remarks': ''
+            }
+
+        days_data.append(day_obj)
+
+    totals = {
+        'cargos': {},
+        'delays_minutes': {},
+        'delays_hms': {},
+        'grand_total': round(total_cargo_sum, 2),
+        'yellow': {
+            'DQ': sum(d['yellow'].get('DQ', 0.0) for d in days_data if d['is_active']),
+            'DR': round(sum(d['yellow'].get('DR', 0.0) for d in days_data if d['is_active']), 2),
+            'DS': round(sum(d['yellow'].get('DS', 0.0) for d in days_data if d['is_active']), 2),
+            'DT': round(sum(d['yellow'].get('DT', 0.0) for d in days_data if d['is_active']), 2),
+            'DU': round(sum(d['yellow'].get('DU', 0.0) for d in days_data if d['is_active']), 2),
+            'DV': round(sum(d['yellow'].get('DV', 0.0) for d in days_data if d['is_active']), 2),
+            'DW': round(sum(d['yellow'].get('DW', 0.0) for d in days_data if d['is_active']), 2),
+            'DX': round(sum(d['yellow'].get('DX', 0.0) for d in days_data if d['is_active']), 2),
+            'DY': round(sum(d['yellow'].get('DY', 0.0) for d in days_data if d['is_active']), 2),
+            'DZ': round(sum(d['yellow'].get('DZ', 0.0) for d in days_data if d['is_active']), 2),
+            'EA': 0.0,
+            'EB': '',
+            'route_hrs': sum(d['yellow'].get('DQ', 0.0) for d in days_data if d['is_active']),
+            'no_cargo_hrs': round(sum(d['yellow'].get('DR', 0.0) for d in days_data if d['is_active']), 2),
+            'rmhs_hrs': round(sum(d['yellow'].get('DS', 0.0) for d in days_data if d['is_active']), 2),
+            'cement_plant_hrs': round(sum(d['yellow'].get('DT', 0.0) for d in days_data if d['is_active']), 2),
+            'bad_wx_hrs': round(sum(d['yellow'].get('DU', 0.0) for d in days_data if d['is_active']), 2),
+            'idle_sen_hrs': round(sum(d['yellow'].get('DV', 0.0) for d in days_data if d['is_active']), 2),
+            'avail_hrs': round(sum(d['yellow'].get('DW', 0.0) for d in days_data if d['is_active']), 2),
+            'sen_qty': round(sum(d['yellow'].get('DX', 0.0) for d in days_data if d['is_active']), 2),
+            'excl_sen_qty': round(sum(d['yellow'].get('DY', 0.0) for d in days_data if d['is_active']), 2),
+            'total_handled': round(sum(d['yellow'].get('DZ', 0.0) for d in days_data if d['is_active']), 2),
+            'net_rate': 0.0,
+            'remarks': ''
+        }
+    }
+
+    for col in cargo_columns:
+        col_letter = col['col_letter']
+        col_sum = sum(d['cargos'].get(col_letter, 0.0) for d in days_data if d['is_active'])
+        totals['cargos'][col_letter] = round(col_sum, 2)
+
+    for col_key, grp, name in delay_columns:
+        mins_sum = sum(d['delays'].get(col_key, 0.0) for d in days_data if d['is_active'])
+        totals['delays_minutes'][col_key] = mins_sum
+        totals['delays_hms'][col_key] = _format_minutes_to_hms(mins_sum)
+
+    active_ea = [d['yellow']['EA'] for d in days_data if d['is_active'] and d['yellow'].get('EA', 0) > 0]
+    ea_avg = round(sum(active_ea) / len(active_ea), 2) if active_ea else 0.0
+    totals['yellow']['EA'] = ea_avg
+    totals['yellow']['net_rate'] = ea_avg
+
+    daily_avg_cargo = (total_cargo_sum / active_days_count) if active_days_count > 0 else 0.0
+
+    group_delays_hms = {}
+    for grp in delay_groups:
+        g_mins = sum(totals['delays_minutes'].get(c[0], 0.0) for c in grp['columns'])
+        group_delays_hms[grp['name']] = _format_minutes_to_hms(g_mins)
+
+    averages = {
+        'daily_avg_cargo': round(daily_avg_cargo, 2),
+        'group_delays_hms': group_delays_hms,
+        'rmhs_total_hms': group_delays_hms.get('RMHS System', '0:00:00'),
+        'dtc_total_hms': group_delays_hms.get('Equipments idle for DTC', '0:00:00'),
+        'no_cargo_total_hms': group_delays_hms.get('No Cargo', '0:00:00'),
+        'non_avail_total_hms': group_delays_hms.get('Non Availability of Equipments', '0:00:00'),
+        'idle_total_hms': group_delays_hms.get('Idle Equipments', '0:00:00'),
+    }
+
+    # Category Summary Table - Dynamically grouped by vessel_cargo.cargo_type
+    type_map = {}
+    for c in cargo_columns:
+        ctype = c['cargo_type'] or 'Other'
+        if ctype not in type_map:
+            type_map[ctype] = []
+        type_map[ctype].append(c['col_letter'])
+
+    categories = []
+    for ctype, cols in type_map.items():
+        c_sum = sum(totals['cargos'].get(col, 0.0) for col in cols)
+        categories.append({
+            'name': ctype,
+            'cargo_type': ctype,
+            'mt': round(c_sum, 2),
+            'pct': round((c_sum / total_cargo_sum * 100.0), 2) if total_cargo_sum > 0 else 0.0,
+            'cols': cols
+        })
+
+    categories.append({
+        'name': 'TOTAL',
+        'cargo_type': 'TOTAL',
+        'mt': round(total_cargo_sum, 2),
+        'pct': 100.0,
+        'cols': []
+    })
+
+    return {
+        'month_label': month_label,
+        'target_year': target_year,
+        'target_month': target_month,
+        'last_day_num': last_day_num,
+        'data_cutoff_date': data_cutoff_date.strftime('%Y-%m-%d'),
+        'cargo_columns': [(c['col_letter'], c['cargo_category'], c['cargo_name'], c['cargo_type']) for c in cargo_columns],
+        'cargo_groups': cargo_groups,
+        'delay_columns': delay_columns,
+        'delay_groups': delay_groups,
+        'yellow_columns': JETTY_YELLOW_COLUMNS,
+        'days': days_data,
+        'totals': totals,
+        'averages': averages,
+        'categories': categories
+    }
+
+
+def _build_jetty_discharge_report_sheet(wb, cur, report_date):
+    """Build Sheet 3: Jetty Discharge Report with exact formatting, formulas,
+    totals, and layout matching Sheet 3 of the reference Excel, dynamically
+    deriving cargo columns and equipment/delay columns.
+    """
+    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+    import openpyxl.utils
+
+    data = _get_jetty_discharge_data(cur, report_date)
+    ws = wb.create_sheet(title="Jetty Disch ")
+    ws.views.sheetView[0].showGridLines = True
+
+    font_title = Font(name='Calibri', size=14, bold=True)
+    font_bold = Font(name='Calibri', size=10, bold=True)
+    font_bold_red = Font(name='Calibri', size=10, bold=True, color='FF0000')
+    font_regular = Font(name='Calibri', size=9, bold=False)
+
+    cyan_fill = PatternFill('solid', fgColor='D0F0F8')
+    yellow_fill = PatternFill('solid', fgColor='FFFF00')
+    total_fill = PatternFill('solid', fgColor='E9EEF5')
+
+    thin_border = Border(
+        left=Side(style='thin', color='B0B0B0'),
+        right=Side(style='thin', color='B0B0B0'),
+        top=Side(style='thin', color='B0B0B0'),
+        bottom=Side(style='thin', color='B0B0B0')
+    )
+
+    align_center = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    align_right = Alignment(horizontal='right', vertical='center')
+    align_left = Alignment(horizontal='left', vertical='center')
+
+    cargo_columns = data['cargo_columns']
+    cargo_groups = data.get('cargo_groups', [])
+    delay_columns = data['delay_columns']
+    delay_groups = data.get('delay_groups', [])
+    yellow_columns = data['yellow_columns']
+    num_cargos = len(cargo_columns)
+
+    first_cargo_col = cargo_columns[0][0]
+    last_cargo_col = cargo_columns[-1][0]
+    col_grades_idx = 2 + num_cargos
+    col_grades_let = openpyxl.utils.get_column_letter(col_grades_idx)
+    col_gt_idx = col_grades_idx + 1
+    col_gt_let = openpyxl.utils.get_column_letter(col_gt_idx)
+
+    delay_start_idx = col_gt_idx + 1
+    yellow_start_idx = delay_start_idx + len(delay_columns)
+    total_sheet_cols = yellow_start_idx + len(yellow_columns) - 1
+
+    # Row 3: Title blocks
+    ws.merge_cells(start_row=3, start_column=1, end_row=3, end_column=col_gt_idx)
+    c_title = ws.cell(3, 1, f"Jetty Discharge For {data['month_label']}")
+    c_title.font = font_title
+    c_title.alignment = align_center
+    c_title.fill = cyan_fill
+    for ci in range(1, col_gt_idx + 1):
+        ws.cell(3, ci).fill = cyan_fill
+        ws.cell(3, ci).border = thin_border
+
+    # Yellow Table Header Row 3 & 4
+    yellow_excel_cols = {}
+    for idx, (y_key, y_name) in enumerate(yellow_columns):
+        c_idx = yellow_start_idx + idx
+        y_let = openpyxl.utils.get_column_letter(c_idx)
+        yellow_excel_cols[y_key] = y_let
+        ws.merge_cells(start_row=3, start_column=c_idx, end_row=4, end_column=c_idx)
+        cell = ws.cell(3, c_idx, y_name)
+        cell.font = font_bold
+        cell.alignment = align_center
+        cell.fill = yellow_fill
+        cell.border = thin_border
+        c4 = ws.cell(4, c_idx)
+        c4.fill = yellow_fill
+        c4.border = thin_border
+
+    # Delay Groups Header in Row 3 & 4 (Dynamic from delay_groups)
+    cur_d_idx = delay_start_idx
+    delay_excel_cols = {}
+    for grp in delay_groups:
+        s_c = cur_d_idx
+        e_c = cur_d_idx + grp['colspan'] - 1
+        if s_c < e_c:
+            ws.merge_cells(start_row=3, start_column=s_c, end_row=4, end_column=e_c)
+        c = ws.cell(3, s_c, grp['name'])
+        c.font = font_bold
+        c.alignment = align_center
+        c.fill = cyan_fill
+        for r in (3, 4):
+            for ci in range(s_c, e_c + 1):
+                ws.cell(r, ci).fill = cyan_fill
+                ws.cell(r, ci).border = thin_border
+        for col in grp['columns']:
+            c_idx = cur_d_idx
+            d_key = col[0]
+            d_let = openpyxl.utils.get_column_letter(c_idx)
+            delay_excel_cols[d_key] = d_let
+            c_cell = ws.cell(5, c_idx, col[2])
+            c_cell.font = font_bold
+            c_cell.alignment = align_center
+            c_cell.fill = cyan_fill
+            c_cell.border = thin_border
+            cur_d_idx += 1
+
+    # Row 4 & 5: Date header
+    ws.merge_cells('A4:A5')
+    c_date = ws['A4']
+    c_date.value = "Date"
+    c_date.font = font_bold
+    c_date.alignment = align_center
+    c_date.fill = cyan_fill
+    ws['A4'].border = thin_border
+    ws['A5'].border = thin_border
+    ws['A5'].fill = cyan_fill
+
+    # Cargo Group Headers (Row 4) and Cargo Names (Row 5)
+    for grp in cargo_groups:
+        s_c = grp['start_idx']
+        e_c = grp['end_idx']
+        if s_c < e_c:
+            ws.merge_cells(start_row=4, start_column=s_c, end_row=4, end_column=e_c)
+        c = ws.cell(4, s_c, grp['name'])
+        c.font = font_bold
+        c.alignment = align_center
+        c.fill = cyan_fill
+        for ci in range(s_c, e_c + 1):
+            ws.cell(4, ci).fill = cyan_fill
+            ws.cell(4, ci).border = thin_border
+
+    for col in cargo_columns:
+        c_idx = openpyxl.utils.column_index_from_string(col[0])
+        c = ws.cell(5, c_idx, col[2])
+        c.font = font_bold
+        c.alignment = align_center
+        c.fill = cyan_fill
+        c.border = thin_border
+
+    # No. of Grades and GRAND TOTAL
+    ws.merge_cells(start_row=4, start_column=col_grades_idx, end_row=5, end_column=col_grades_idx)
+    c = ws.cell(4, col_grades_idx, "No. of Grades of Cargo")
+    c.font = font_bold
+    c.alignment = align_center
+    c.fill = cyan_fill
+    ws.cell(5, col_grades_idx).fill = cyan_fill
+    ws.cell(4, col_grades_idx).border = thin_border
+    ws.cell(5, col_grades_idx).border = thin_border
+
+    ws.merge_cells(start_row=4, start_column=col_gt_idx, end_row=5, end_column=col_gt_idx)
+    c = ws.cell(4, col_gt_idx, "GRAND TOTAL (MT)")
+    c.font = font_bold_red
+    c.alignment = align_center
+    c.fill = cyan_fill
+    ws.cell(5, col_gt_idx).fill = cyan_fill
+    ws.cell(4, col_gt_idx).border = thin_border
+    ws.cell(5, col_gt_idx).border = thin_border
+
+    start_row = 6
+    last_row = start_row + data['last_day_num'] - 1
+
+    no_cargo_cols = next((g['columns'] for g in delay_groups if g['name'] == 'No Cargo'), [])
+    idle_cols = next((g['columns'] for g in delay_groups if g['name'] == 'Idle Equipments'), [])
+
+    for idx, day_obj in enumerate(data['days']):
+        r = start_row + idx
+        ws.cell(r, 1, day_obj['date_label']).alignment = align_center
+        ws.cell(r, 1).border = thin_border
+        ws.cell(r, 1).font = font_regular
+
+        if not day_obj['is_active']:
+            for c in range(2, total_sheet_cols + 1):
+                cell = ws.cell(r, c)
+                cell.border = thin_border
+            continue
+
+        for col in cargo_columns:
+            col_letter = col[0]
+            col_idx = openpyxl.utils.column_index_from_string(col_letter)
+            val = day_obj['cargos'].get(col_letter)
+            cell = ws.cell(r, col_idx)
+            cell.border = thin_border
+            cell.font = font_regular
+            cell.alignment = align_right
+            if val is not None and val > 0:
+                cell.value = round(val, 2)
+                cell.number_format = '#,##0' if val.is_integer() else '#,##0.00'
+
+        bv_cell = ws.cell(r, col_grades_idx)
+        bv_cell.value = f"=COUNT({first_cargo_col}{r}:{last_cargo_col}{r})"
+        bv_cell.font = font_bold
+        bv_cell.alignment = align_center
+        bv_cell.border = thin_border
+
+        bw_cell = ws.cell(r, col_gt_idx)
+        bw_cell.value = f'=IF((SUM({first_cargo_col}{r}:{last_cargo_col}{r}))=0,"",(SUM({first_cargo_col}{r}:{last_cargo_col}{r})))'
+        bw_cell.font = font_bold_red
+        bw_cell.alignment = align_right
+        bw_cell.number_format = '#,##0.00'
+        bw_cell.border = thin_border
+
+        for d_key, grp, name in delay_columns:
+            col_let = delay_excel_cols[d_key]
+            col_idx = openpyxl.utils.column_index_from_string(col_let)
+            mins = day_obj['delays'].get(d_key)
+            cell = ws.cell(r, col_idx)
+            cell.border = thin_border
+            cell.font = font_regular
+            cell.alignment = align_center
+            if mins is not None and mins > 0:
+                cell.value = round(mins / 1440.0, 6)
+                cell.number_format = '[h]:mm;@'
+
+        # Yellow columns formulas
+        ws.cell(r, openpyxl.utils.column_index_from_string(yellow_excel_cols['DQ']), 168).number_format = '0'
+
+        # DR: No Cargo
+        nc_terms = []
+        if 'CP' in delay_excel_cols: nc_terms.append(f"{delay_excel_cols['CP']}{r}")
+        if 'CQ' in delay_excel_cols and 'CR' in delay_excel_cols:
+            nc_terms.append(f"({delay_excel_cols['CQ']}{r}+{delay_excel_cols['CR']}{r})/2")
+        elif 'CQ' in delay_excel_cols:
+            nc_terms.append(f"{delay_excel_cols['CQ']}{r}")
+        elif 'CR' in delay_excel_cols:
+            nc_terms.append(f"{delay_excel_cols['CR']}{r}")
+
+        for col in no_cargo_cols:
+            k = col[0]
+            if k not in ('CP', 'CQ', 'CR') and k in delay_excel_cols:
+                nc_terms.append(f"{delay_excel_cols[k]}{r}")
+
+        dr_formula = f"=({'+'.join(nc_terms)})*24" if nc_terms else "0.00"
+        ws.cell(r, openpyxl.utils.column_index_from_string(yellow_excel_cols['DR']), dr_formula).number_format = '0.00'
+
+        # DS: RMHS
+        ds_formula = f'=({delay_excel_cols["BY"]}{r}+{delay_excel_cols["BX"]}{r}+{delay_excel_cols["BZ"]}{r}+{delay_excel_cols["CA"]}{r}+{delay_excel_cols["CC"]}{r}+{delay_excel_cols["CB"]}{r})*24'
+        ws.cell(r, openpyxl.utils.column_index_from_string(yellow_excel_cols['DS']), ds_formula).number_format = '0.00'
+
+        # DT: Cement
+        dt_formula = f'=({delay_excel_cols["CE"]}{r})*24'
+        ws.cell(r, openpyxl.utils.column_index_from_string(yellow_excel_cols['DT']), dt_formula).number_format = '0.00'
+
+        # DU: Bad Wx
+        ws.cell(r, openpyxl.utils.column_index_from_string(yellow_excel_cols['DU']), day_obj['yellow'].get('DU', 0.0)).number_format = '0.00'
+
+        # DV: Idle Sen
+        dv_terms = [f"{delay_excel_cols[c[0]]}{r}" for c in idle_cols if c[0] in delay_excel_cols]
+        dv_formula = f"=({'+'.join(dv_terms)})*24" if dv_terms else "0.00"
+        ws.cell(r, openpyxl.utils.column_index_from_string(yellow_excel_cols['DV']), dv_formula).number_format = '0.00'
+
+        # DW: Available Hours
+        y_DQ = yellow_excel_cols['DQ']
+        y_DR = yellow_excel_cols['DR']
+        y_DS = yellow_excel_cols['DS']
+        y_DU = yellow_excel_cols['DU']
+        y_DT = yellow_excel_cols['DT']
+        dw_formula = f'={y_DQ}{r}-{y_DR}{r}-{y_DS}{r}-{y_DU}{r}-{y_DT}{r}'
+        ws.cell(r, openpyxl.utils.column_index_from_string(yellow_excel_cols['DW']), dw_formula).number_format = '0.00'
+
+        # DX: Sennebogen MT
+        dx_val = day_obj['yellow'].get('DX', 0.0)
+        ws.cell(r, openpyxl.utils.column_index_from_string(yellow_excel_cols['DX']), dx_val if dx_val > 0 else 0).number_format = '#,##0'
+
+        # DY: Cargo Excl J5 & J1
+        y_DX = yellow_excel_cols['DX']
+        ws.cell(r, openpyxl.utils.column_index_from_string(yellow_excel_cols['DY']), f'={col_gt_let}{r}-{y_DX}{r}').number_format = '#,##0'
+
+        # DZ: Total Cargo Handled
+        ws.cell(r, openpyxl.utils.column_index_from_string(yellow_excel_cols['DZ']), f'={col_gt_let}{r}').number_format = '#,##0'
+
+        # EA: Net Discharge Rate / Day
+        y_DZ = yellow_excel_cols['DZ']
+        y_DW = yellow_excel_cols['DW']
+        ws.cell(r, openpyxl.utils.column_index_from_string(yellow_excel_cols['EA']), f'=({y_DZ}{r}/{y_DW}{r})*{y_DQ}{r}').number_format = '#,##0.00'
+        ws.cell(r, openpyxl.utils.column_index_from_string(yellow_excel_cols['EB']), '')
+
+        for col_letter, _ in yellow_columns:
+            c = ws.cell(r, openpyxl.utils.column_index_from_string(yellow_excel_cols[col_letter]))
+            c.border = thin_border
+            c.font = font_regular
+            c.alignment = align_right if col_letter in ('DQ', 'DR', 'DS', 'DT', 'DU', 'DV', 'DW', 'DX', 'DY', 'DZ', 'EA') else align_left
+
+    tot_row = last_row + 1
+    ws.cell(tot_row, 1, 'Total').font = font_bold
+    ws.cell(tot_row, 1).alignment = align_center
+    ws.cell(tot_row, 1).border = thin_border
+    ws.cell(tot_row, 1).fill = total_fill
+
+    for col in cargo_columns:
+        col_letter = col[0]
+        col_idx = openpyxl.utils.column_index_from_string(col_letter)
+        c = ws.cell(tot_row, col_idx, f"=SUM({col_letter}{start_row}:{col_letter}{last_row})")
+        c.font = font_bold_red
+        c.alignment = align_right
+        c.number_format = '#,##0.0'
+        c.border = thin_border
+        c.fill = total_fill
+
+    bw_tot = ws.cell(tot_row, col_gt_idx, f"=SUM({col_gt_let}{start_row}:{col_gt_let}{last_row})")
+    bw_tot.font = font_bold_red
+    bw_tot.alignment = align_right
+    bw_tot.number_format = '#,##0.00'
+    bw_tot.border = thin_border
+    bw_tot.fill = total_fill
+
+    for d_key, grp, name in delay_columns:
+        col_let = delay_excel_cols[d_key]
+        col_idx = openpyxl.utils.column_index_from_string(col_let)
+        c = ws.cell(tot_row, col_idx, f"=SUM({col_let}{start_row}:{col_let}{last_row})")
+        c.font = font_bold
+        c.alignment = align_center
+        c.number_format = '[h]:mm;@'
+        c.border = thin_border
+        c.fill = total_fill
+
+    for y_key, _ in yellow_columns:
+        col_let = yellow_excel_cols[y_key]
+        col_idx = openpyxl.utils.column_index_from_string(col_let)
+        c = ws.cell(tot_row, col_idx)
+        c.font = font_bold
+        c.alignment = align_right
+        c.border = thin_border
+        c.fill = total_fill
+        if y_key == 'EA':
+            c.value = f"=AVERAGE({col_let}{start_row}:{col_let}{last_row})"
+            c.number_format = '#,##0'
+        elif y_key != 'EB':
+            c.value = f"=SUM({col_let}{start_row}:{col_let}{last_row})"
+            c.number_format = '#,##0.00' if y_key in ('DR', 'DS', 'DT', 'DU', 'DV', 'DW') else '#,##0'
+
+    avg_row = tot_row + 1
+    bw_avg = ws.cell(avg_row, col_gt_idx, f"={col_gt_let}{tot_row}/COUNT({col_gt_let}{start_row}:{col_gt_let}{last_row})")
+    bw_avg.font = font_bold
+    bw_avg.alignment = align_right
+    bw_avg.number_format = '#,##0.00'
+    bw_avg.border = thin_border
+
+    # Row 39 delay group sum formulas (Dynamic from delay_groups)
+    for grp in delay_groups:
+        if not grp['columns']:
+            continue
+        first_col_key = grp['columns'][0][0]
+        last_col_key = grp['columns'][-1][0]
+        start_c = delay_excel_cols[first_col_key]
+        end_c = delay_excel_cols[last_col_key]
+        s_idx = openpyxl.utils.column_index_from_string(start_c)
+        e_idx = openpyxl.utils.column_index_from_string(end_c)
+        if s_idx < e_idx:
+            ws.merge_cells(start_row=avg_row, start_column=s_idx, end_row=avg_row, end_column=e_idx)
+        c = ws.cell(avg_row, s_idx, f"=SUM({start_c}{tot_row}:{end_c}{tot_row})")
+        c.font = font_bold
+        c.alignment = align_center
+        c.number_format = '[h]:mm;@'
+        for ci in range(s_idx, e_idx + 1):
+            ws.cell(avg_row, ci).border = thin_border
+
+
+    ws.column_dimensions['A'].width = 12
+    for c in range(2, num_cargos + 3):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(c)].width = 11
+    ws.column_dimensions[col_gt_let].width = 14
+    for c in range(delay_start_idx, yellow_start_idx):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(c)].width = 10
+    for c in range(yellow_start_idx, total_sheet_cols + 1):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(c)].width = 14
+
+    return ws
+
+
 @bp.route(
     '/api/module/RP01/daily_progress_report_excel',
     methods=['GET', 'POST']
@@ -7316,6 +8428,12 @@ def daily_progress_report_excel():
         # =====================================================
 
         _build_vessel_discharge_progress_sheet(wb, cur, report_date)
+
+        # =====================================================
+        # SHEET 3: JETTY DISCHARGE REPORT (DAILY PROGRESS REPORT)
+        # =====================================================
+
+        _build_jetty_discharge_report_sheet(wb, cur, report_date)
 
         # =====================================================
         # GENERATE FILE
